@@ -1,0 +1,4 @@
+{
+  "title_include": ["product designer", "senior product designer", "product design"],
+  "title_exclude": ["intern", "internship", "junior"]
+}

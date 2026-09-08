@@ -1,0 +1,5 @@
+[
+  {"name": "Пример: Notion", "platform": "greenhouse", "slug": "notion"},
+  {"name": "Пример: Figma", "platform": "ashby", "slug": "figma"},
+  {"name": "Пример: Revolut", "platform": "lever", "slug": "revolut"}
+]
