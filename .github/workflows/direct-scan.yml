@@ -11,6 +11,9 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: job-alerts
     steps:
       - uses: actions/checkout@v4
 
