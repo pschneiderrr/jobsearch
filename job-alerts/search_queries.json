@@ -3,8 +3,8 @@
     "jobs.ashbyhq.com",
     "boards.greenhouse.io",
     "jobs.lever.co",
-    "career.teamtailor.com",
-    "jobs.recruitee.com",
+    "teamtailor.com",
+    "recruitee.com",
     "apply.workable.com",
     "jobs.workable.com"
   ],
@@ -15,5 +15,6 @@
   ],
   "exclude": [
     "US remote"
-  ]
+  ],
+  "max_age_days": 14
 }
