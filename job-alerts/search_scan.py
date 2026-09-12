@@ -105,10 +105,21 @@ def _normalize_url(u):
     return u.rstrip("/")
 
 
+def _extract_code(u):
+    """Последний сегмент пути URL — обычно это ID/shortcode вакансии.
+    Используется как запасной способ сопоставления, когда ATS отдаёт
+    ссылку на вакансию в другом формате, чем та, что нашёл поиск."""
+    path = urlparse(u).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] if path else ""
+
+
 def find_job(url):
     """Возвращает найденный job-dict с этой платформы, или None если платформа
-    не поддерживается / вакансия уже закрыта / не удалось подтвердить."""
+    не поддерживается / вакансия уже закрыта / не удалось подтвердить.
+    Сначала пробуем точное совпадение URL, если не вышло — совпадение по ID
+    (устойчивее: некоторые ATS отдают ссылку в другом формате, чем в поиске)."""
     target = _normalize_url(url)
+    target_code = _extract_code(target)
     for pattern, platform in URL_PATTERNS:
         m = pattern.match(url)
         if not m:
@@ -121,8 +132,12 @@ def find_job(url):
         for j in jobs:
             if _normalize_url(j["url"]) == target:
                 return j
+        if target_code:
+            for j in jobs:
+                job_code = j["id"].split(":")[-1]
+                if job_code and (job_code == target_code or job_code in target_code or target_code in job_code):
+                    return j
         return None
-    return None
 
 
 def main():
