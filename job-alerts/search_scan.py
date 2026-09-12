@@ -6,8 +6,13 @@
    при малом числе совпадений по site: молча расширяет выдачу на весь интернет
    (так в Telegram попадали LinkedIn/Indeed/Glassdoor и т.п.).
 2. Локация вакансии проверяется по структурированному полю из самого ATS API
-   (не по тексту сниппета) — так отсекаются вакансии с явной привязкой к США,
-   даже если в заголовке или сниппете нет буквального "US remote".
+   (не по тексту сниппета), белым списком: пропускаются только вакансии,
+   похожие на европейский часовой пояс (Европа + явно разрешённые соседи —
+   Кавказ, Эмираты, Россия, Турция и т.п.). Всё, что не удалось однозначно
+   отнести к этому списку — отсеивается, а не пропускается.
+
+Тот же ответ ATS API, что используется для проверки локации, содержит и дату
+публикации — используем её же, без лишних запросов.
 
 Домены/ключевые слова — в search_queries.json. Состояние — state/seen_search.json.
 """
@@ -32,18 +37,31 @@ URL_PATTERNS = [
     (re.compile(r"^https?://(?:boards|job-boards)\.greenhouse\.io/([^/]+)/"), "greenhouse"),
     (re.compile(r"^https?://jobs\.lever\.co/([^/]+)/"), "lever"),
     (re.compile(r"^https?://apply\.workable\.com/([^/]+)/"), "workable"),
+    (re.compile(r"^https?://([^.]+)\.recruitee\.com/"), "recruitee"),
+    (re.compile(r"^https?://([^.]+)\.teamtailor\.com/"), "teamtailor"),
 ]
 
-US_SIGNALS = [
-    "new york", "nyc", "san francisco", " sf,", "los angeles", " la,", "seattle",
-    "austin", "boston", "chicago", "miami", "denver", "atlanta", "united states",
-    " usa", "(us)", "us only", "us-based", " ca,", " ny,", " tx,", " wa,", " ma,",
-]
-EU_SIGNALS = [
-    "europe", "emea", "remote - eu", "remote (eu)", "uk", "united kingdom",
-    "germany", "berlin", "netherlands", "amsterdam", "spain", "barcelona",
-    "madrid", "france", "paris", "portugal", "lisbon", "poland", "warsaw",
-    "ireland", "dublin", "sweden", "stockholm", "italy", "milan",
+EUROPE_TZ_SIGNALS = [
+    "europe", "emea", "remote - eu", "remote (eu)", "cet", "cest",
+    "uk", "united kingdom", "england", "scotland", "wales", "london",
+    "ireland", "dublin",
+    "spain", "madrid", "barcelona", "portugal", "lisbon",
+    "france", "paris", "belgium", "brussels", "netherlands", "amsterdam", "luxembourg",
+    "germany", "berlin", "munich", "hamburg", "austria", "vienna",
+    "switzerland", "zurich", "geneva",
+    "sweden", "stockholm", "norway", "oslo", "denmark", "copenhagen",
+    "finland", "helsinki", "iceland",
+    "italy", "milan", "rome", "greece", "athens",
+    "poland", "warsaw", "czech", "prague", "hungary", "budapest",
+    "romania", "bucharest", "bulgaria", "sofia", "croatia", "zagreb",
+    "slovakia", "slovenia", "serbia", "belgrade",
+    "estonia", "tallinn", "latvia", "riga", "lithuania", "vilnius",
+    "malta", "cyprus",
+    "russia", "moscow", "saint petersburg", "st. petersburg",
+    "georgia", "tbilisi", "armenia", "yerevan", "azerbaijan", "baku",
+    "uae", "emirates", "dubai", "abu dhabi",
+    "turkey", "istanbul", "israel", "tel aviv", "egypt", "cairo",
+    "south africa", "johannesburg",
 ]
 
 
@@ -101,8 +119,14 @@ def is_allowed_domain(url, allowed_domains):
     return any(host == d or host.endswith("." + d) for d in allowed_domains)
 
 
-def is_us_only(url):
-    """True — по структурированной локации похоже на позицию только для США."""
+def is_european_timezone(location):
+    loc = (location or "").lower()
+    return any(s in loc for s in EUROPE_TZ_SIGNALS)
+
+
+def find_job(url):
+    """Возвращает найденный job-dict с этой платформы (с location и posted_at),
+    или None если платформа не поддерживается / не удалось подтвердить."""
     for pattern, platform in URL_PATTERNS:
         m = pattern.match(url)
         if not m:
@@ -111,17 +135,12 @@ def is_us_only(url):
         try:
             jobs = FETCHERS[platform](slug)
         except Exception:
-            return False
+            return None
         for j in jobs:
             if j["url"] == url:
-                loc = (j.get("location") or "").lower()
-                if any(s in loc for s in EU_SIGNALS):
-                    return False
-                if any(s in loc for s in US_SIGNALS):
-                    return True
-                return False
-        return False
-    return False
+                return j
+        return None
+    return None
 
 
 def main():
@@ -132,7 +151,7 @@ def main():
     new_seen = set(seen)
     new_results = []
     skipped_domain = 0
-    skipped_us = 0
+    skipped_not_eu = 0
 
     for q in queries:
         try:
@@ -149,20 +168,32 @@ def main():
             if not is_allowed_domain(link, allowed_domains):
                 skipped_domain += 1
                 continue
-            if is_us_only(link):
-                skipped_us += 1
+
+            job = find_job(link)
+            if job is None or not is_european_timezone(job.get("location")):
+                skipped_not_eu += 1
                 continue
 
-            new_results.append({"title": item.get("title", ""), "link": link, "query": q})
+            new_results.append(
+                {
+                    "title": item.get("title", ""),
+                    "link": link,
+                    "location": job.get("location", ""),
+                    "posted_at": job.get("posted_at") or "дата неизвестна",
+                }
+            )
 
     for r in new_results:
-        text = f"🔍 {r['title']}\n{r['link']}"
+        text = (
+            f"🔍 {r['title']}\n{r['location']}\n"
+            f"Опубликовано: {r['posted_at']}\n{r['link']}"
+        )
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
     print(
         f"Запросов: {len(queries)}, новых результатов: {len(new_results)}, "
-        f"отсеяно не по домену: {skipped_domain}, отсеяно как US: {skipped_us}"
+        f"отсеяно не по домену: {skipped_domain}, отсеяно как не-Европа: {skipped_not_eu}"
     )
 
 
