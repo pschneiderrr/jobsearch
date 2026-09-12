@@ -139,7 +139,12 @@ def main():
                 continue
 
             job = find_job(link)
-            if job is None or not is_european_timezone(job.get("location")):
+            if job is None:
+                print(f"[гео] не удалось определить: {link}")
+                skipped_geo += 1
+                continue
+            if not is_european_timezone(job.get("location")):
+                print(f"[гео] не Европа ({job.get('location')!r}): {link}")
                 skipped_geo += 1
                 continue
             if not workplace_allowed(job):
