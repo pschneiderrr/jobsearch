@@ -1,15 +1,20 @@
 """
-Опрашивает Greenhouse/Lever/Ashby по компаниям из companies.json,
-фильтрует по ключевым словам из keywords.json,
-шлёт новые вакансии в Telegram.
-Состояние (что уже видели) хранится в state/seen_direct.json и коммитится обратно в репо workflow'ом.
+Опрашивает Greenhouse/Lever/Ashby/Workable по компаниям из companies.json.
+Если для компании не указаны platform/slug — пытается угадать их сама,
+перебирая варианты написания названия по всем четырём API, и запоминает
+результат в state/resolved_companies.json, чтобы не гадать заново каждый запуск.
+Фильтрует по ключевым словам из keywords.json, шлёт новые вакансии в Telegram.
 """
 import os
+import re
 import json
 import requests
 from pathlib import Path
 
+from ats_fetchers import FETCHERS
+
 STATE_FILE = Path("state/seen_direct.json")
+RESOLVED_FILE = Path("state/resolved_companies.json")
 COMPANIES_FILE = Path("companies.json")
 KEYWORDS_FILE = Path("keywords.json")
 
@@ -32,11 +37,7 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(
         url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": False,
-        },
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": False},
         timeout=15,
     )
     if not resp.ok:
@@ -54,72 +55,63 @@ def matches_keywords(title, keywords):
     return True
 
 
-def fetch_greenhouse(slug):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    jobs = r.json().get("jobs", [])
-    return [
-        {
-            "id": f"greenhouse:{slug}:{j['id']}",
-            "title": j.get("title", ""),
-            "url": j.get("absolute_url", ""),
-            "location": (j.get("location") or {}).get("name", ""),
-        }
-        for j in jobs
-    ]
+def slug_candidates(name):
+    alt = None
+    m = re.search(r"\(([^)]+)\)", name)
+    base = re.sub(r"\([^)]*\)", "", name).strip()
+    if m:
+        alt = m.group(1).strip()
+
+    def forms(s):
+        smashed = re.sub(r"[^a-z0-9]+", "", s.lower())
+        hyphen = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+        return [x for x in {smashed, hyphen} if x]
+
+    candidates = forms(base)
+    if alt:
+        candidates += [c for c in forms(alt) if c not in candidates]
+    return candidates
 
 
-def fetch_lever(slug):
-    url = f"https://api.lever.co/v1/postings/{slug}?mode=json"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    jobs = r.json()
-    return [
-        {
-            "id": f"lever:{slug}:{j['id']}",
-            "title": j.get("text", ""),
-            "url": j.get("hostedUrl", ""),
-            "location": (j.get("categories") or {}).get("location", ""),
-        }
-        for j in jobs
-    ]
+def auto_resolve(name, resolved_cache):
+    if name in resolved_cache:
+        return resolved_cache[name]
 
+    for slug in slug_candidates(name):
+        for platform, fetcher in FETCHERS.items():
+            try:
+                fetcher(slug)
+            except Exception:
+                continue
+            match = {"platform": platform, "slug": slug}
+            resolved_cache[name] = match
+            print(f"Автоопределено: {name} -> {platform}:{slug} (сверь вручную — возможна коллизия имён)")
+            return match
 
-def fetch_ashby(slug):
-    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    jobs = data.get("jobs") or data.get("jobPostings") or []
-    result = []
-    for j in jobs:
-        jid = j.get("id") or j.get("jobId")
-        result.append(
-            {
-                "id": f"ashby:{slug}:{jid}",
-                "title": j.get("title", ""),
-                "url": j.get("jobUrl") or j.get("applyUrl") or "",
-                "location": j.get("locationName") or j.get("location", ""),
-            }
-        )
-    return result
-
-
-FETCHERS = {"greenhouse": fetch_greenhouse, "lever": fetch_lever, "ashby": fetch_ashby}
+    resolved_cache[name] = None
+    print(f"Не удалось определить платформу для «{name}» — впиши platform/slug вручную в companies.json")
+    return None
 
 
 def main():
     companies = load_json(COMPANIES_FILE, [])
     keywords = load_json(KEYWORDS_FILE, {"title_include": [], "title_exclude": []})
     seen = set(load_json(STATE_FILE, []))
+    resolved_cache = load_json(RESOLVED_FILE, {})
     new_seen = set(seen)
     new_jobs = []
 
     for c in companies:
-        platform = c["platform"]
-        slug = c["slug"]
-        name = c.get("name", slug)
+        name = c.get("name", "")
+        platform = c.get("platform") or ""
+        slug = c.get("slug") or ""
+
+        if not platform or not slug:
+            match = auto_resolve(name, resolved_cache)
+            if not match:
+                continue
+            platform, slug = match["platform"], match["slug"]
+
         fetcher = FETCHERS.get(platform)
         if not fetcher:
             print(f"Неизвестная платформа {platform} для {name}")
@@ -127,7 +119,7 @@ def main():
         try:
             jobs = fetcher(slug)
         except Exception as e:
-            print(f"Ошибка при запросе {name} ({platform}): {e}")
+            print(f"Ошибка при запросе {name} ({platform}:{slug}): {e}")
             continue
         for j in jobs:
             if j["id"] in seen:
@@ -141,6 +133,7 @@ def main():
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
+    save_json(RESOLVED_FILE, resolved_cache)
     print(f"Проверено компаний: {len(companies)}, новых подходящих вакансий: {len(new_jobs)}")
 
 
