@@ -14,6 +14,10 @@ URL из поиска с записью в ATS API часто не срабат�
 Если вакансию не удалось заново найти на текущей доске компании — это почти
 всегда значит, что она уже закрыта/снята, и такая ссылка отсеивается.
 
+Google ранжирует выдачу по релевантности, а не по дате — поэтому запрос
+ограничен последним месяцем (tbs=qdr:m), а внутри одного прогона результаты
+сортируются по дате публикации (свежее — первым).
+
 Домены/ключевые слова/свежесть — в search_queries.json. Состояние — state/seen_search.json.
 """
 import os
@@ -85,7 +89,9 @@ def build_queries(config):
 def search(query):
     url = "https://google.serper.dev/search"
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers, json={"q": query, "num": 10}, timeout=15)
+    # tbs=qdr:m — ограничивает выдачу Google последним месяцем, иначе Google ранжирует
+    # по релевантности/популярности, а не по дате, и свежие вакансии тонут в топ-10.
+    r = requests.post(url, headers=headers, json={"q": query, "num": 10, "tbs": "qdr:m"}, timeout=15)
     if not r.ok:
         raise RuntimeError(f"{r.status_code}: {r.text}")
     return r.json().get("organic", [])
@@ -199,6 +205,9 @@ def main():
                     "posted_at": posted_at or "дата неизвестна",
                 }
             )
+
+    # свежее — вперёд; неизвестная дата уходит в конец списка
+    new_results.sort(key=lambda r: r["posted_at"] if r["posted_at"] != "дата неизвестна" else "0000-00-00", reverse=True)
 
     for r in new_results:
         text = (
