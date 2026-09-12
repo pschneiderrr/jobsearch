@@ -87,9 +87,55 @@ def fetch_workable(slug):
     return result
 
 
+def fetch_recruitee(slug):
+    url = f"https://{slug}.recruitee.com/api/offers/"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    offers = data.get("offers")
+    if offers is None:
+        raise ValueError("unexpected recruitee response")
+    result = []
+    for j in offers:
+        parts = [j.get("city"), j.get("state"), j.get("country")]
+        location = ", ".join(p for p in parts if p)
+        result.append(
+            {
+                "id": f"recruitee:{slug}:{j.get('id')}",
+                "title": j.get("title", ""),
+                "url": j.get("careers_url") or j.get("careersUrl") or "",
+                "location": location,
+            }
+        )
+    return result
+
+
+def fetch_teamtailor(slug):
+    url = f"https://{slug}.teamtailor.com/jobs.json"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if jobs is None:
+        raise ValueError("unexpected teamtailor response")
+    result = []
+    for j in jobs:
+        result.append(
+            {
+                "id": f"teamtailor:{slug}:{j.get('id')}",
+                "title": j.get("title", ""),
+                "url": j.get("url") or j.get("apply_url") or "",
+                "location": j.get("location") or j.get("city") or "",
+            }
+        )
+    return result
+
+
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "lever": fetch_lever,
     "ashby": fetch_ashby,
     "workable": fetch_workable,
+    "recruitee": fetch_recruitee,
+    "teamtailor": fetch_teamtailor,
 }
