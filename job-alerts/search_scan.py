@@ -12,8 +12,7 @@ URL из поиска с записью в ATS API часто не срабат�
 Свежесть (max_age_days) остаётся жёстким фильтром — тут суждение не нужно.
 
 Если вакансию не удалось заново найти на текущей доске компании — это почти
-всегда значит, что она уже закрыта/снята, и такая ссылка отсеивается
-(а не показывается с пустыми полями).
+всегда значит, что она уже закрыта/снята, и такая ссылка отсеивается.
 
 Домены/ключевые слова/свежесть — в search_queries.json. Состояние — state/seen_search.json.
 """
@@ -106,3 +105,119 @@ def _normalize_url(u):
     for suffix in ("/application", "/apply"):
         if u.endswith(suffix):
             u = u[: -len(suffix)]
+    return u.rstrip("/")
+
+
+def _extract_code(u):
+    """Последний сегмент пути URL — обычно это ID/shortcode вакансии.
+    Используется как запасной способ сопоставления, когда ATS отдаёт
+    ссылку на вакансию в другом формате, чем та, что нашёл поиск."""
+    path = urlparse(u).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] if path else ""
+
+
+def find_job(url):
+    """Возвращает найденный job-dict с этой платформы, или None если платформа
+    не поддерживается / вакансия уже закрыта / не удалось подтвердить.
+    Сначала пробуем точное совпадение URL, если не вышло — совпадение по ID
+    (устойчивее: некоторые ATS отдают ссылку в другом формате, чем в поиске)."""
+    target = _normalize_url(url)
+    target_code = _extract_code(target)
+    for pattern, platform in URL_PATTERNS:
+        m = pattern.match(url)
+        if not m:
+            continue
+        slug = m.group(1)
+        try:
+            jobs = FETCHERS[platform](slug)
+        except Exception:
+            return None
+        for j in jobs:
+            if _normalize_url(j["url"]) == target:
+                return j
+        if target_code:
+            for j in jobs:
+                job_code = j["id"].split(":")[-1]
+                if job_code and (job_code == target_code or job_code in target_code or target_code in job_code):
+                    return j
+        return None
+    return None
+
+
+def main():
+    config = load_json(QUERIES_FILE, {"sites": [], "keywords": []})
+    allowed_domains = [d.lower() for d in config.get("sites", [])]
+    max_age_days = config.get("max_age_days", 14)
+    queries = build_queries(config)
+    seen = set(load_json(STATE_FILE, []))
+    new_seen = set(seen)
+    new_results = []
+    skipped_domain = 0
+    skipped_unreachable = 0
+    skipped_us = 0
+    skipped_stale = 0
+
+    for q in queries:
+        try:
+            items = search(q)
+        except Exception as e:
+            print(f"Ошибка запроса '{q}': {e}")
+            continue
+        for item in items:
+            link = item.get("link")
+            if not link or link in seen:
+                continue
+            new_seen.add(link)
+
+            if not is_allowed_domain(link, allowed_domains):
+                skipped_domain += 1
+                continue
+
+            job = find_job(link)
+            if job is None:
+                # не нашли эту вакансию заново на текущей доске компании —
+                # почти наверняка она уже закрыта/снята, ссылка мёртвая
+                skipped_unreachable += 1
+                continue
+
+            location = job.get("location") or ""
+            if is_clearly_us(location):
+                skipped_us += 1
+                continue
+
+            posted_at = job.get("posted_at")
+            if not is_recent(posted_at, max_age_days):
+                skipped_stale += 1
+                continue
+
+            new_results.append(
+                {
+                    "title": item.get("title", ""),
+                    "link": link,
+                    "location": location or "неизвестна",
+                    "workplace": describe_workplace(job),
+                    "posted_at": posted_at or "дата неизвестна",
+                }
+            )
+
+    for r in new_results:
+        text = (
+            f"🔍 [поиск] {r['title']}\n"
+            f"Локация: {r['location']}\n"
+            f"Формат: {r['workplace']}\n"
+            f"Опубликовано: {r['posted_at']}\n"
+            f"{r['link']}"
+        )
+        send_telegram(text)
+
+    save_json(STATE_FILE, sorted(new_seen))
+    print(
+        f"Запросов: {len(queries)}, новых результатов: {len(new_results)}, "
+        f"отсеяно не по домену: {skipped_domain}, отсеяно как недостижимые/закрытые: {skipped_unreachable}, "
+        f"отсеяно как явный US: {skipped_us}, отсеяно как устаревшее: {skipped_stale}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
