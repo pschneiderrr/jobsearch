@@ -11,7 +11,7 @@ import json
 import requests
 from pathlib import Path
 
-from ats_fetchers import FETCHERS, workplace_allowed, is_recent
+from ats_fetchers import FETCHERS, describe_workplace, is_recent
 
 STATE_FILE = Path("state/seen_direct.json")
 RESOLVED_FILE = Path("state/resolved_companies.json")
@@ -128,15 +128,19 @@ def main():
             new_seen.add(j["id"])
             if not matches_keywords(j["title"], keywords):
                 continue
-            if not workplace_allowed(j):
-                continue
             if not is_recent(j.get("posted_at"), max_age_days):
                 continue
             new_jobs.append({**j, "company": name})
 
     for j in new_jobs:
         posted = j.get("posted_at") or "дата неизвестна"
-        text = f"🎯 [шорт-лист] {j['company']}: {j['title']}\n{j['location']}\nОпубликовано: {posted}\n{j['url']}"
+        text = (
+            f"🎯 [шорт-лист] {j['company']}: {j['title']}\n"
+            f"Локация: {j['location'] or 'неизвестна'}\n"
+            f"Формат: {describe_workplace(j)}\n"
+            f"Опубликовано: {posted}\n"
+            f"{j['url']}"
+        )
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
