@@ -88,7 +88,7 @@ def main():
             new_results.append({"title": item.get("title", ""), "link": link, "query": q})
 
     for r in new_results:
-        text = f"🔍 [поиск] {r['title']}\n{r['link']}"
+        text = f"🔍 {r['title']}\n{r['link']}"
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
