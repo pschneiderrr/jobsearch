@@ -1,4 +1,20 @@
 {
-  "title_include": ["product designer", "senior product designer", "product design"],
+  "title_include": [
+    "product designer",
+    "senior product designer",
+    "lead product designer",
+    "staff product designer",
+    "principal product designer",
+    "founding product designer",
+    "founding designer",
+    "first designer",
+    "design lead",
+    "product design lead",
+    "ux/ui designer",
+    "ux designer",
+    "ui designer",
+    "digital product designer",
+    "interaction designer"
+  ],
   "title_exclude": ["intern", "internship", "junior"]
 }
