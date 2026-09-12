@@ -129,7 +129,8 @@ def main():
                 new_jobs.append({**j, "company": name})
 
     for j in new_jobs:
-        text = f"🎯 [шорт-лист] {j['company']}: {j['title']}\n{j['location']}\n{j['url']}"
+        posted = j.get("posted_at") or "дата неизвестна"
+        text = f"🎯 [шорт-лист] {j['company']}: {j['title']}\n{j['location']}\nОпубликовано: {posted}\n{j['url']}"
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
