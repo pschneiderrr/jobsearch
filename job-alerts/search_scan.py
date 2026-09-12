@@ -1,25 +1,50 @@
 """
-Опрашивает Greenhouse/Lever/Ashby/Workable по компаниям из companies.json.
-Если для компании не указаны platform/slug — пытается угадать их сама,
-перебирая варианты написания названия по всем четырём API, и запоминает
-результат в state/resolved_companies.json, чтобы не гадать заново каждый запуск.
-Фильтрует по ключевым словам из keywords.json, шлёт новые вакансии в Telegram.
+Ищет по job-board доменам через Serper.dev (обёртка над Google-поиском).
+Два фильтра поверх результатов поиска, потому что сам поиск не даёт гарантий:
+
+1. Домен ссылки должен быть строго в списке из search_queries.json — Google
+   при малом числе совпадений по site: молча расширяет выдачу на весь интернет
+   (так в Telegram попадали LinkedIn/Indeed/Glassdoor и т.п.).
+2. Локация вакансии проверяется по структурированному полю из самого ATS API
+   (не по тексту сниппета) — так отсекаются вакансии с явной привязкой к США,
+   даже если в заголовке или сниппете нет буквального "US remote".
+
+Домены/ключевые слова — в search_queries.json. Состояние — state/seen_search.json.
 """
 import os
 import re
 import json
 import requests
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ats_fetchers import FETCHERS
 
-STATE_FILE = Path("state/seen_direct.json")
-RESOLVED_FILE = Path("state/resolved_companies.json")
-COMPANIES_FILE = Path("companies.json")
-KEYWORDS_FILE = Path("keywords.json")
+STATE_FILE = Path("state/seen_search.json")
+QUERIES_FILE = Path("search_queries.json")
 
+SERPER_API_KEY = os.environ["SERPER_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+URL_PATTERNS = [
+    (re.compile(r"^https?://jobs\.ashbyhq\.com/([^/]+)/"), "ashby"),
+    (re.compile(r"^https?://(?:boards|job-boards)\.greenhouse\.io/([^/]+)/"), "greenhouse"),
+    (re.compile(r"^https?://jobs\.lever\.co/([^/]+)/"), "lever"),
+    (re.compile(r"^https?://apply\.workable\.com/([^/]+)/"), "workable"),
+]
+
+US_SIGNALS = [
+    "new york", "nyc", "san francisco", " sf,", "los angeles", " la,", "seattle",
+    "austin", "boston", "chicago", "miami", "denver", "atlanta", "united states",
+    " usa", "(us)", "us only", "us-based", " ca,", " ny,", " tx,", " wa,", " ma,",
+]
+EU_SIGNALS = [
+    "europe", "emea", "remote - eu", "remote (eu)", "uk", "united kingdom",
+    "germany", "berlin", "netherlands", "amsterdam", "spain", "barcelona",
+    "madrid", "france", "paris", "portugal", "lisbon", "poland", "warsaw",
+    "ireland", "dublin", "sweden", "stockholm", "italy", "milan",
+]
 
 
 def load_json(path, default):
@@ -44,97 +69,101 @@ def send_telegram(text):
         print("Telegram error:", resp.text)
 
 
-def matches_keywords(title, keywords):
-    t = (title or "").lower()
-    inc = keywords.get("title_include", [])
-    exc = keywords.get("title_exclude", [])
-    if inc and not any(k.lower() in t for k in inc):
+def build_queries(config):
+    sites = config.get("sites", [])
+    keywords = config.get("keywords", [])
+    exclude = config.get("exclude", [])
+    site_filter = " OR ".join(f"site:{s}" for s in sites)
+    exclude_filter = " ".join(f'-"{e}"' for e in exclude)
+
+    queries = []
+    for k in keywords:
+        q = f'"{k}"'
+        if site_filter:
+            q += f" ({site_filter})"
+        if exclude_filter:
+            q += f" {exclude_filter}"
+        queries.append(q)
+    return queries
+
+
+def search(query):
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json={"q": query, "num": 10}, timeout=15)
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code}: {r.text}")
+    return r.json().get("organic", [])
+
+
+def is_allowed_domain(url, allowed_domains):
+    host = urlparse(url).netloc.lower()
+    return any(host == d or host.endswith("." + d) for d in allowed_domains)
+
+
+def is_us_only(url):
+    """True — по структурированной локации похоже на позицию только для США."""
+    for pattern, platform in URL_PATTERNS:
+        m = pattern.match(url)
+        if not m:
+            continue
+        slug = m.group(1)
+        try:
+            jobs = FETCHERS[platform](slug)
+        except Exception:
+            return False
+        for j in jobs:
+            if j["url"] == url:
+                loc = (j.get("location") or "").lower()
+                if any(s in loc for s in EU_SIGNALS):
+                    return False
+                if any(s in loc for s in US_SIGNALS):
+                    return True
+                return False
         return False
-    if any(k.lower() in t for k in exc):
-        return False
-    return True
-
-
-def slug_candidates(name):
-    alt = None
-    m = re.search(r"\(([^)]+)\)", name)
-    base = re.sub(r"\([^)]*\)", "", name).strip()
-    if m:
-        alt = m.group(1).strip()
-
-    def forms(s):
-        smashed = re.sub(r"[^a-z0-9]+", "", s.lower())
-        hyphen = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
-        return [x for x in {smashed, hyphen} if x]
-
-    candidates = forms(base)
-    if alt:
-        candidates += [c for c in forms(alt) if c not in candidates]
-    return candidates
-
-
-def auto_resolve(name, resolved_cache):
-    if name in resolved_cache:
-        return resolved_cache[name]
-
-    for slug in slug_candidates(name):
-        for platform, fetcher in FETCHERS.items():
-            try:
-                fetcher(slug)
-            except Exception:
-                continue
-            match = {"platform": platform, "slug": slug}
-            resolved_cache[name] = match
-            print(f"Автоопределено: {name} -> {platform}:{slug} (сверь вручную — возможна коллизия имён)")
-            return match
-
-    resolved_cache[name] = None
-    print(f"Не удалось определить платформу для «{name}» — впиши platform/slug вручную в companies.json")
-    return None
+    return False
 
 
 def main():
-    companies = load_json(COMPANIES_FILE, [])
-    keywords = load_json(KEYWORDS_FILE, {"title_include": [], "title_exclude": []})
+    config = load_json(QUERIES_FILE, {"sites": [], "keywords": []})
+    allowed_domains = [d.lower() for d in config.get("sites", [])]
+    queries = build_queries(config)
     seen = set(load_json(STATE_FILE, []))
-    resolved_cache = load_json(RESOLVED_FILE, {})
     new_seen = set(seen)
-    new_jobs = []
+    new_results = []
+    skipped_domain = 0
+    skipped_us = 0
 
-    for c in companies:
-        name = c.get("name", "")
-        platform = c.get("platform") or ""
-        slug = c.get("slug") or ""
-
-        if not platform or not slug:
-            match = auto_resolve(name, resolved_cache)
-            if not match:
-                continue
-            platform, slug = match["platform"], match["slug"]
-
-        fetcher = FETCHERS.get(platform)
-        if not fetcher:
-            print(f"Неизвестная платформа {platform} для {name}")
-            continue
+    for q in queries:
         try:
-            jobs = fetcher(slug)
+            items = search(q)
         except Exception as e:
-            print(f"Ошибка при запросе {name} ({platform}:{slug}): {e}")
+            print(f"Ошибка запроса '{q}': {e}")
             continue
-        for j in jobs:
-            if j["id"] in seen:
+        for item in items:
+            link = item.get("link")
+            if not link or link in seen:
                 continue
-            new_seen.add(j["id"])
-            if matches_keywords(j["title"], keywords):
-                new_jobs.append({**j, "company": name})
+            new_seen.add(link)
 
-    for j in new_jobs:
-        text = f"🎯 [шорт-лист] {j['company']}: {j['title']}\n{j['location']}\n{j['url']}"
+            if not is_allowed_domain(link, allowed_domains):
+                skipped_domain += 1
+                continue
+            if is_us_only(link):
+                skipped_us += 1
+                continue
+
+            new_results.append({"title": item.get("title", ""), "link": link, "query": q})
+
+    for r in new_results:
+        text = f"🔍 {r['title']}\n{r['link']}"
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
-    save_json(RESOLVED_FILE, resolved_cache)
-    print(f"Проверено компаний: {len(companies)}, новых подходящих вакансий: {len(new_jobs)}")
+    print(
+        f"Запросов: {len(queries)}, новых результатов: {len(new_results)}, "
+        f"отсеяно не по домену: {skipped_domain}, отсеяно как US: {skipped_us}"
+    )
 
 
 if __name__ == "__main__":
