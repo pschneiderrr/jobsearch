@@ -11,7 +11,7 @@ import json
 import requests
 from pathlib import Path
 
-from ats_fetchers import FETCHERS
+from ats_fetchers import FETCHERS, workplace_allowed, is_recent
 
 STATE_FILE = Path("state/seen_direct.json")
 RESOLVED_FILE = Path("state/resolved_companies.json")
@@ -96,6 +96,7 @@ def auto_resolve(name, resolved_cache):
 def main():
     companies = load_json(COMPANIES_FILE, [])
     keywords = load_json(KEYWORDS_FILE, {"title_include": [], "title_exclude": []})
+    max_age_days = keywords.get("max_age_days", 14)
     seen = set(load_json(STATE_FILE, []))
     resolved_cache = load_json(RESOLVED_FILE, {})
     new_seen = set(seen)
@@ -125,8 +126,13 @@ def main():
             if j["id"] in seen:
                 continue
             new_seen.add(j["id"])
-            if matches_keywords(j["title"], keywords):
-                new_jobs.append({**j, "company": name})
+            if not matches_keywords(j["title"], keywords):
+                continue
+            if not workplace_allowed(j):
+                continue
+            if not is_recent(j.get("posted_at"), max_age_days):
+                continue
+            new_jobs.append({**j, "company": name})
 
     for j in new_jobs:
         posted = j.get("posted_at") or "дата неизвестна"
