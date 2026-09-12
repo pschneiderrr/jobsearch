@@ -1,12 +1,15 @@
 """
 Ищет по job-board доменам через Serper.dev (обёртка над Google-поиском).
-Фильтры поверх результатов поиска:
 
-1. Домен ссылки — строго из списка в search_queries.json.
-2. Локация — белый список (is_european_timezone в ats_fetchers.py): ЕС + UK +
-   явные исключения по часовому поясу (Кавказ, Эмираты, Россия, Турция).
-3. Формат работы (workplace_allowed) — только remote, кроме Испании (ок гибрид).
-4. Свежесть (is_recent) — не старше max_age_days из конфига.
+Раньше пытались жёстко фильтровать по гео/формату работы — но точное сопоставление
+URL из поиска с записью в ATS API часто не срабатывает технически (реферальные
+метки в ссылке, другой формат URL и т.п.), из-за чего фильтр резал не только США,
+но и нормальные европейские вакансии, которые просто не удалось подтвердить.
+
+Текущий принцип: жёстко блокируем только то, что ЯВНО и однозначно США
+(is_clearly_us). Всё остальное пропускаем, добавляя в сообщение строки
+с локацией и форматом работы — дальше человек решает сам, глядя на текст.
+Свежесть (max_age_days) остаётся жёстким фильтром — тут суждение не нужно.
 
 Домены/ключевые слова/свежесть — в search_queries.json. Состояние — state/seen_search.json.
 """
@@ -17,7 +20,7 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ats_fetchers import FETCHERS, is_european_timezone, workplace_allowed, is_recent
+from ats_fetchers import FETCHERS, is_clearly_us, describe_workplace, is_recent
 
 STATE_FILE = Path("state/seen_search.json")
 QUERIES_FILE = Path("search_queries.json")
@@ -90,9 +93,22 @@ def is_allowed_domain(url, allowed_domains):
     return any(host == d or host.endswith("." + d) for d in allowed_domains)
 
 
+def _normalize_url(u):
+    """Убирает query-параметры (реферальные метки вроде ?gh_src=...) и типовые
+    суффиксы подстраниц — ссылка из поиска и URL из ATS API редко совпадают буквально."""
+    if not u:
+        return ""
+    u = u.split("?")[0].split("#")[0]
+    for suffix in ("/application", "/apply"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+    return u.rstrip("/")
+
+
 def find_job(url):
     """Возвращает найденный job-dict с этой платформы, или None если платформа
-    не поддерживается / не удалось подтвердить (сетевая ошибка и т.п.)."""
+    не поддерживается / вакансия уже закрыта / не удалось подтвердить."""
+    target = _normalize_url(url)
     for pattern, platform in URL_PATTERNS:
         m = pattern.match(url)
         if not m:
@@ -103,7 +119,7 @@ def find_job(url):
         except Exception:
             return None
         for j in jobs:
-            if j["url"] == url:
+            if _normalize_url(j["url"]) == target:
                 return j
         return None
     return None
@@ -118,8 +134,7 @@ def main():
     new_seen = set(seen)
     new_results = []
     skipped_domain = 0
-    skipped_geo = 0
-    skipped_format = 0
+    skipped_us = 0
     skipped_stale = 0
 
     for q in queries:
@@ -138,19 +153,15 @@ def main():
                 skipped_domain += 1
                 continue
 
-            job = find_job(link)
-            if job is None:
-                print(f"[гео] не удалось определить: {link}")
-                skipped_geo += 1
+            job = find_job(link) or {}
+            location = job.get("location") or ""
+
+            if is_clearly_us(location):
+                skipped_us += 1
                 continue
-            if not is_european_timezone(job.get("location")):
-                print(f"[гео] не Европа ({job.get('location')!r}): {link}")
-                skipped_geo += 1
-                continue
-            if not workplace_allowed(job):
-                skipped_format += 1
-                continue
-            if not is_recent(job.get("posted_at"), max_age_days):
+
+            posted_at = job.get("posted_at")
+            if not is_recent(posted_at, max_age_days):
                 skipped_stale += 1
                 continue
 
@@ -158,23 +169,27 @@ def main():
                 {
                     "title": item.get("title", ""),
                     "link": link,
-                    "location": job.get("location", ""),
-                    "posted_at": job.get("posted_at") or "дата неизвестна",
+                    "location": location or "неизвестна",
+                    "workplace": describe_workplace(job),
+                    "posted_at": posted_at or "дата неизвестна",
                 }
             )
 
     for r in new_results:
         text = (
-            f"🔍 [поиск] {r['title']}\n{r['location']}\n"
-            f"Опубликовано: {r['posted_at']}\n{r['link']}"
+            f"🔍 [поиск] {r['title']}\n"
+            f"Локация: {r['location']}\n"
+            f"Формат: {r['workplace']}\n"
+            f"Опубликовано: {r['posted_at']}\n"
+            f"{r['link']}"
         )
         send_telegram(text)
 
     save_json(STATE_FILE, sorted(new_seen))
     print(
         f"Запросов: {len(queries)}, новых результатов: {len(new_results)}, "
-        f"отсеяно не по домену: {skipped_domain}, отсеяно по гео: {skipped_geo}, "
-        f"отсеяно по формату: {skipped_format}, отсеяно как устаревшее: {skipped_stale}"
+        f"отсеяно не по домену: {skipped_domain}, отсеяно как явный US: {skipped_us}, "
+        f"отсеяно как устаревшее: {skipped_stale}"
     )
 
 
