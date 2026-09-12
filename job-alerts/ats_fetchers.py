@@ -99,11 +99,27 @@ EUROPE_TZ_SIGNALS = [
 US_OVERRIDE_SIGNALS = ["united states", " usa", "u.s.", "(us)"]
 
 
-def is_european_timezone(location):
+def is_clearly_us(location):
+    """True — только если локация ЯВНО указывает на США (без двусмысленности типа
+    штата Georgia). Используется как единственный жёсткий гео-блок в search_scan.py —
+    остальное пропускается, а локация/формат просто показываются в сообщении."""
     loc = (location or "").lower()
-    if any(s in loc for s in US_OVERRIDE_SIGNALS):
-        return False
-    return any(s in loc for s in EUROPE_TZ_SIGNALS)
+    return any(s in loc for s in US_OVERRIDE_SIGNALS)
+
+
+def describe_workplace(job):
+    """Текстовая метка формата работы для отображения в Telegram (не для фильтрации)."""
+    wt = (job.get("workplace_type") or "").strip()
+    if wt:
+        return wt
+    loc = (job.get("location") or "").lower()
+    if "hybrid" in loc:
+        return "Hybrid (по тексту локации)"
+    if any(s in loc for s in ["on-site", "onsite", "in office", "in-office"]):
+        return "On-site (по тексту локации)"
+    if "remote" in loc:
+        return "Remote (по тексту локации)"
+    return "не указан"
 
 
 def fetch_greenhouse(slug):
