@@ -1,7 +1,19 @@
 {
-  "queries": [
-    "\"product designer\" remote",
-    "\"senior product designer\" remote",
-    "\"product designer\" europe"
+  "sites": [
+    "jobs.ashbyhq.com",
+    "boards.greenhouse.io",
+    "jobs.lever.co",
+    "career.teamtailor.com",
+    "jobs.recruitee.com",
+    "apply.workable.com",
+    "jobs.workable.com"
+  ],
+  "keywords": [
+    "founding designer",
+    "ux/ui designer",
+    "product designer"
+  ],
+  "exclude": [
+    "US remote"
   ]
 }
