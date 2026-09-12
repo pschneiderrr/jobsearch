@@ -37,13 +37,15 @@ def is_recent(posted_at, max_age_days):
     return (datetime.now(timezone.utc) - posted).days <= max_age_days
 
 
+# Испания (в первую очередь Барселона) — единственное исключение, где ок гибрид.
 SPAIN_SIGNALS = ["spain", "barcelona", "madrid", "valencia", "sevilla", "seville", "bilbao", "malaga", "málaga"]
 
 
 def workplace_allowed(job):
     """True — формат работы подходит: remote где угодно, либо hybrid, если это Испания.
     On-site — никогда. Приоритет структурному полю workplace_type (есть у Ashby/Lever),
-    иначе эвристика по тексту локации."""
+    иначе эвристика по тексту локации (менее надёжно — так ловятся не все on-site у
+    платформ без этого поля)."""
     wt = (job.get("workplace_type") or "").strip().lower()
     loc = (job.get("location") or "").lower()
     is_spain = any(s in loc for s in SPAIN_SIGNALS)
@@ -52,7 +54,7 @@ def workplace_allowed(job):
         return True
     if wt == "hybrid":
         return is_spain
-    if wt:
+    if wt:  # "onsite" или любое другое значение
         return False
 
     if "hybrid" in loc:
@@ -63,10 +65,189 @@ def workplace_allowed(job):
         return True
     parts = [p.strip() for p in loc.split(",") if p.strip()]
     if len(parts) >= 3:
-        return False
-    return True
+        return False  # несколько городов через запятую без "remote" — похоже на мультихаб onsite
+    return True  # неопределённо (например просто "London, UK") — тут не блокируем,
+                 # в search_scan.py решает ещё и is_european_timezone
 
 
+# Белый список: ЕС + UK + явные исключения по часовому поясу.
 EUROPE_TZ_SIGNALS = [
     "europe", "emea", "remote - eu", "remote (eu)", "cet", "cest",
     "uk", "united kingdom", "england", "scotland", "wales", "london",
+    "ireland", "dublin",
+    "spain", "madrid", "barcelona", "portugal", "lisbon",
+    "france", "paris", "belgium", "brussels", "netherlands", "amsterdam", "luxembourg",
+    "germany", "berlin", "munich", "hamburg", "austria", "vienna",
+    "switzerland", "zurich", "geneva",
+    "sweden", "stockholm", "norway", "oslo", "denmark", "copenhagen",
+    "finland", "helsinki", "iceland",
+    "italy", "milan", "rome", "greece", "athens",
+    "poland", "warsaw", "czech", "prague", "hungary", "budapest",
+    "romania", "bucharest", "bulgaria", "sofia", "croatia", "zagreb",
+    "slovakia", "slovenia", "serbia", "belgrade",
+    "estonia", "tallinn", "latvia", "riga", "lithuania", "vilnius",
+    "malta", "cyprus",
+    # явные исключения по часовому поясу
+    "georgia", "tbilisi", "armenia", "yerevan", "azerbaijan", "baku",
+    "uae", "emirates", "dubai", "abu dhabi",
+    "russia", "moscow", "saint petersburg", "st. petersburg",
+    "turkey", "istanbul",
+]
+
+# Слова, при виде которых исключаем всегда, даже если что-то выше совпало по ошибке
+# (пример реальной коллизии: "Georgia" — и страна на Кавказе, и штат США).
+US_OVERRIDE_SIGNALS = ["united states", " usa", "u.s.", "(us)"]
+
+
+def is_european_timezone(location):
+    loc = (location or "").lower()
+    if any(s in loc for s in US_OVERRIDE_SIGNALS):
+        return False
+    return any(s in loc for s in EUROPE_TZ_SIGNALS)
+
+
+def fetch_greenhouse(slug):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    jobs = r.json().get("jobs", [])
+    return [
+        {
+            "id": f"greenhouse:{slug}:{j['id']}",
+            "title": j.get("title", ""),
+            "url": j.get("absolute_url", ""),
+            "location": (j.get("location") or {}).get("name", ""),
+            "posted_at": _fmt_date(j.get("first_published_at") or j.get("updated_at")),
+            "workplace_type": "",
+        }
+        for j in jobs
+    ]
+
+
+def fetch_lever(slug):
+    url = f"https://api.lever.co/v1/postings/{slug}?mode=json"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    jobs = r.json()
+    if not isinstance(jobs, list):
+        raise ValueError("unexpected lever response")
+    return [
+        {
+            "id": f"lever:{slug}:{j['id']}",
+            "title": j.get("text", ""),
+            "url": j.get("hostedUrl", ""),
+            "location": (j.get("categories") or {}).get("location", ""),
+            "posted_at": _fmt_date(j.get("createdAt")),
+            "workplace_type": j.get("workplaceType", ""),
+        }
+        for j in jobs
+    ]
+
+
+def fetch_ashby(slug):
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    jobs = data.get("jobs")
+    if jobs is None:
+        jobs = data.get("jobPostings")
+    if jobs is None:
+        raise ValueError("unexpected ashby response")
+    result = []
+    for j in jobs:
+        jid = j.get("id") or j.get("jobId")
+        result.append(
+            {
+                "id": f"ashby:{slug}:{jid}",
+                "title": j.get("title", ""),
+                "url": j.get("jobUrl") or j.get("applyUrl") or "",
+                "location": j.get("locationName") or j.get("location", ""),
+                "posted_at": _fmt_date(j.get("publishedAt")),
+                "workplace_type": j.get("workplaceType", ""),
+            }
+        )
+    return result
+
+
+def fetch_workable(slug):
+    url = f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    jobs = data.get("jobs")
+    if jobs is None:
+        raise ValueError("unexpected workable response")
+    result = []
+    for j in jobs:
+        loc = j.get("location") or {}
+        place = loc.get("city") or loc.get("region") or loc.get("country") or ""
+        result.append(
+            {
+                "id": f"workable:{slug}:{j.get('shortcode') or j.get('id')}",
+                "title": j.get("title", ""),
+                "url": j.get("url") or j.get("shortlink") or "",
+                "location": place,
+                "posted_at": _fmt_date(j.get("published_on") or j.get("created_at")),
+                "workplace_type": "",
+            }
+        )
+    return result
+
+
+def fetch_recruitee(slug):
+    url = f"https://{slug}.recruitee.com/api/offers/"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    offers = data.get("offers")
+    if offers is None:
+        raise ValueError("unexpected recruitee response")
+    result = []
+    for j in offers:
+        parts = [j.get("city"), j.get("state"), j.get("country")]
+        location = ", ".join(p for p in parts if p)
+        result.append(
+            {
+                "id": f"recruitee:{slug}:{j.get('id')}",
+                "title": j.get("title", ""),
+                "url": j.get("careers_url") or j.get("careersUrl") or "",
+                "location": location,
+                "posted_at": _fmt_date(j.get("created_at") or j.get("createdAt") or j.get("published_at")),
+                "workplace_type": "",
+            }
+        )
+    return result
+
+
+def fetch_teamtailor(slug):
+    url = f"https://{slug}.teamtailor.com/jobs.json"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if jobs is None:
+        raise ValueError("unexpected teamtailor response")
+    result = []
+    for j in jobs:
+        result.append(
+            {
+                "id": f"teamtailor:{slug}:{j.get('id')}",
+                "title": j.get("title", ""),
+                "url": j.get("url") or j.get("apply_url") or "",
+                "location": j.get("location") or j.get("city") or "",
+                "posted_at": _fmt_date(j.get("date_published") or j.get("postedAt") or j.get("created_at")),
+                "workplace_type": "",
+            }
+        )
+    return result
+
+
+FETCHERS = {
+    "greenhouse": fetch_greenhouse,
+    "lever": fetch_lever,
+    "ashby": fetch_ashby,
+    "workable": fetch_workable,
+    "recruitee": fetch_recruitee,
+    "teamtailor": fetch_teamtailor,
+}
