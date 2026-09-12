@@ -1,9 +1,28 @@
 """
 Общие функции получения вакансий с публичных API разных ATS.
 Используются и direct_scan.py (мониторинг шорт-листа), и search_scan.py
-(проверка реальной локации вакансий, найденных через поиск).
+(проверка реальной локации и даты публикации вакансий, найденных через поиск).
 """
+from datetime import datetime, timezone
+
 import requests
+
+
+def _fmt_date(value):
+    """Приводит ISO-строку или epoch-timestamp (Lever отдаёт в мс) к виду YYYY-MM-DD."""
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        except Exception:
+            return value[:10] if len(value) >= 10 else value
+    return None
 
 
 def fetch_greenhouse(slug):
@@ -17,6 +36,7 @@ def fetch_greenhouse(slug):
             "title": j.get("title", ""),
             "url": j.get("absolute_url", ""),
             "location": (j.get("location") or {}).get("name", ""),
+            "posted_at": _fmt_date(j.get("first_published_at") or j.get("updated_at")),
         }
         for j in jobs
     ]
@@ -35,6 +55,7 @@ def fetch_lever(slug):
             "title": j.get("text", ""),
             "url": j.get("hostedUrl", ""),
             "location": (j.get("categories") or {}).get("location", ""),
+            "posted_at": _fmt_date(j.get("createdAt")),
         }
         for j in jobs
     ]
@@ -59,6 +80,7 @@ def fetch_ashby(slug):
                 "title": j.get("title", ""),
                 "url": j.get("jobUrl") or j.get("applyUrl") or "",
                 "location": j.get("locationName") or j.get("location", ""),
+                "posted_at": _fmt_date(j.get("publishedAt")),
             }
         )
     return result
@@ -82,6 +104,7 @@ def fetch_workable(slug):
                 "title": j.get("title", ""),
                 "url": j.get("url") or j.get("shortlink") or "",
                 "location": place,
+                "posted_at": _fmt_date(j.get("published_on") or j.get("created_at")),
             }
         )
     return result
@@ -105,6 +128,7 @@ def fetch_recruitee(slug):
                 "title": j.get("title", ""),
                 "url": j.get("careers_url") or j.get("careersUrl") or "",
                 "location": location,
+                "posted_at": _fmt_date(j.get("created_at") or j.get("createdAt") or j.get("published_at")),
             }
         )
     return result
@@ -126,6 +150,7 @@ def fetch_teamtailor(slug):
                 "title": j.get("title", ""),
                 "url": j.get("url") or j.get("apply_url") or "",
                 "location": j.get("location") or j.get("city") or "",
+                "posted_at": _fmt_date(j.get("date_published") or j.get("postedAt") or j.get("created_at")),
             }
         )
     return result
